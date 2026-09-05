@@ -1,0 +1,40 @@
+#!/usr/bin/env php
+<?php
+
+use Illuminate\Foundation\Application;
+use Symfony\Component\Console\Input\ArgvInput;
+
+define('LARAVEL_START', microtime(true));
+
+$blocked = [
+    'migrate',
+    'migrate:fresh',
+    'migrate:refresh',
+    'migrate:reset',
+    'migrate:rollback',
+    'migrate:install',
+    'db:wipe',
+    'db:seed',
+    'schema:dump',
+    'schema:load',
+];
+$cmd = null;
+foreach (array_slice($_SERVER['argv'] ?? [], 1) as $arg) {
+    if (! str_starts_with($arg, '-')) {
+        $cmd = $arg;
+        break;
+    }
+}
+if ($cmd !== null && in_array($cmd, $blocked, true)) {
+    fwrite(STDERR, "refusing artisan {$cmd}: this API must not alter the shared Postgres catalog.\nCatalog access is read-only SQL against v1_* views.\n");
+    exit(2);
+}
+
+require __DIR__.'/vendor/autoload.php';
+
+/** @var Application $app */
+$app = require_once __DIR__.'/bootstrap/app.php';
+
+$status = $app->handleCommand(new ArgvInput);
+
+exit($status);
