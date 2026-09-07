@@ -1,0 +1,14 @@
+{
+  "name": "carolina-codes-laravel",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "install": "composer install --no-interaction --prefer-dist && cp -n .env.example .env && php artisan key:generate --force && php artisan package:discover --ansi",
+  "ports": [
+    {
+      "name": "api",
+      "port": 4022
+    }
+  ]
+}

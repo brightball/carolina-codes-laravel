@@ -6,7 +6,9 @@
 .phpactor.json
 .phpunit.result.cache
 /.codex
-/.cursor/
+/.cursor/*
+!.cursor/environment.json
+!.cursor/Dockerfile
 /.idea
 /.nova
 /.phpunit.cache
