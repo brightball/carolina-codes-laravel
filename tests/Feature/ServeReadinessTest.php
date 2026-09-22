@@ -93,8 +93,7 @@ class ServeReadinessTest extends TestCase
         $hung = $this->listenHung();
         $port = $this->freePort();
         $logs = $this->tempDir();
-        $loaded = php_ini_loaded_file();
-        $phprc = is_string($loaded) ? $loaded : '';
+        $phprc = $this->passthroughIni();
         $databaseUrl = 'postgres://sentinel:sentinel@127.0.0.1:5999/sentinel_db';
         $public = 'http://127.0.0.1:'.$port;
         $carolina = 'http://127.0.0.1:'.$hung['port'];
@@ -144,8 +143,7 @@ class ServeReadinessTest extends TestCase
     {
         $hung = $this->listenHung();
         $port = $this->freePort();
-        $loaded = php_ini_loaded_file();
-        $phprc = is_string($loaded) ? $loaded : '';
+        $phprc = $this->passthroughIni();
         $stdout = $this->tempDir().'/serve-empty.out';
         $stderr = $this->tempDir().'/serve-empty.err';
         $databaseUrl = 'postgres://sentinel:sentinel@127.0.0.1:5999/sentinel_db';
@@ -477,6 +475,18 @@ PHP);
         $this->savedEnv = [];
     }
 
+    private function passthroughIni(): string
+    {
+        $loaded = php_ini_loaded_file();
+        if (is_string($loaded) && $loaded !== '' && is_file($loaded)) {
+            return $loaded;
+        }
+        $path = $this->tempDir().'/phprc.ini';
+        file_put_contents($path, "expose_php=0\n");
+
+        return $path;
+    }
+
     private function freePort(): int
     {
         $socket = stream_socket_server('tcp://127.0.0.1:0');
@@ -510,8 +520,8 @@ PHP);
             return;
         }
         $status = proc_get_status($proc);
-        if (is_array($status) && ! empty($status['running']) && ! empty($status['pid']) && function_exists('posix_kill')) {
-            posix_kill((int) $status['pid'], SIGTERM);
+        if (is_array($status) && ! empty($status['running'])) {
+            proc_terminate($proc, 15);
             $deadline = microtime(true) + 3;
             while (microtime(true) < $deadline) {
                 $status = proc_get_status($proc);
@@ -521,7 +531,7 @@ PHP);
                 usleep(30000);
             }
             if (! empty($status['running'])) {
-                posix_kill((int) $status['pid'], SIGKILL);
+                proc_terminate($proc, 9);
             }
         }
         proc_close($proc);

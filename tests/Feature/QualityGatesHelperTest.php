@@ -144,6 +144,62 @@ class QualityGatesHelperTest extends TestCase
         }
     }
 
+    public function test_helper_stages_git_so_gitleaks_runs_without_system_git(): void
+    {
+        require_once base_path('scripts/ci-env.php');
+        $root = $this->tempDir();
+        $this->assertTrue(stage_git($root.'/tools', $root.'/lib', $root.'/git-core'));
+        install_git_wrapper($root.'/tools', $root.'/lib', $root.'/git-core');
+        $this->assertTrue(is_executable($root.'/tools/git'));
+        $this->assertTrue(is_executable($root.'/tools/git.real'));
+        $this->assertNotEmpty(glob($root.'/git-core/*') ?: []);
+
+        $repo = $root.'/repo';
+        mkdir($repo);
+        $env = [
+            'PATH' => $root.'/tools',
+            'HOME' => $root,
+            'GIT_AUTHOR_NAME' => 'Test',
+            'GIT_AUTHOR_EMAIL' => 'test@example.com',
+            'GIT_COMMITTER_NAME' => 'Test',
+            'GIT_COMMITTER_EMAIL' => 'test@example.com',
+        ];
+        $this->runCaptured([$root.'/tools/git', 'init'], $repo, $env);
+        file_put_contents($repo.'/README', "hello\n");
+        $this->runCaptured([$root.'/tools/git', 'add', 'README'], $repo, $env);
+        $this->runCaptured([$root.'/tools/git', 'commit', '-m', 'init'], $repo, $env);
+
+        $gitleaks = trim((string) shell_exec('command -v gitleaks'));
+        $this->assertNotSame('', $gitleaks);
+        $output = $this->runCaptured([$gitleaks, 'detect', '--source', $repo], $repo, $env);
+        $this->assertStringContainsString('no leaks found', $output);
+    }
+
+    /**
+     * @param  list<string>  $command
+     * @param  array<string, string>  $env
+     */
+    private function runCaptured(array $command, string $cwd, array $env): string
+    {
+        $proc = proc_open(
+            $command,
+            [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            $pipes,
+            $cwd,
+            $env
+        );
+        $this->assertIsResource($proc);
+        $stdout = stream_get_contents($pipes[1]);
+        $stderr = stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $code = proc_close($proc);
+        $combined = $stdout.$stderr;
+        $this->assertSame(0, $code, $combined);
+
+        return $combined;
+    }
+
     /**
      * @param  array<string, string>  $extra
      */
@@ -231,10 +287,9 @@ class QualityGatesHelperTest extends TestCase
             return;
         }
         $status = proc_get_status($proc);
-        if (is_array($status) && ! empty($status['pid']) && function_exists('posix_kill')) {
-            posix_kill((int) $status['pid'], SIGTERM);
+        if (is_array($status) && ! empty($status['running'])) {
+            proc_terminate($proc, 15);
         }
-        proc_terminate($proc);
         proc_close($proc);
     }
 

@@ -282,9 +282,15 @@ function cmd_pack(): void
 
         pack_tools($stage.'/tools');
         pack_php_files($stage);
+        ensure_dir($stage.'/git-core');
+        if (! (is_string(getenv('CI_ENV_TOOLS_DIR')) && getenv('CI_ENV_TOOLS_DIR') !== '')) {
+            if (! stage_git($stage.'/tools', $stage.'/php-lib', $stage.'/git-core')) {
+                exit(1);
+            }
+        }
 
         ensure_dir(dirname($tar));
-        sh('tar -C '.escapeshellarg($stage).' -czf '.escapeshellarg($tar).' workspace tools php-ext php-ini php-lib');
+        sh('tar -C '.escapeshellarg($stage).' -czf '.escapeshellarg($tar).' workspace tools php-ext php-ini php-lib git-core');
     });
     echo "packed $tar\n";
 }
@@ -327,31 +333,99 @@ function pack_php_files(string $stage): void
 
 function pack_shared_libs(string $extDir, string $dest): void
 {
-    $skip = '/^(libc|libm|libdl|libpthread|librt|libgcc_s|ld-linux)/';
     foreach (glob($extDir.'/*.so') ?: [] as $so) {
-        $out = [];
-        exec('ldd '.escapeshellarg($so).' 2>/dev/null', $out, $code);
-        if ($code !== 0) {
+        pack_binary_libs($so, $dest);
+    }
+}
+
+function pack_binary_libs(string $binary, string $dest): void
+{
+    $skip = '/^(libc|libm|libdl|libpthread|librt|libgcc_s|ld-linux)/';
+    $out = [];
+    exec('ldd '.escapeshellarg($binary).' 2>/dev/null', $out, $code);
+    if ($code !== 0) {
+        return;
+    }
+    ensure_dir($dest);
+    foreach ($out as $line) {
+        if (! preg_match('/=>\s+(\/\S+)/', $line, $match)) {
             continue;
         }
-        foreach ($out as $line) {
-            if (! preg_match('/=>\s+(\/\S+)/', $line, $match)) {
-                continue;
-            }
-            $lib = $match[1];
-            $base = basename($lib);
-            if (preg_match($skip, $base) === 1) {
-                continue;
-            }
-            if (! is_file($lib)) {
-                continue;
-            }
-            $target = $dest.'/'.$base;
-            if (! is_file($target)) {
-                copy($lib, $target);
-            }
+        $lib = $match[1];
+        $base = basename($lib);
+        if (preg_match($skip, $base) === 1) {
+            continue;
+        }
+        if (! is_file($lib)) {
+            continue;
+        }
+        $target = $dest.'/'.$base;
+        if (! is_file($target)) {
+            copy($lib, $target);
         }
     }
+}
+
+/**
+ * gitleaks detect shells out to git. Check containers do not apt-get, so the
+ * prepare artifact carries the git binary, its libraries, and exec-path.
+ */
+function stage_git(string $toolsDir, string $libDir, string $execDir): bool
+{
+    $src = which_tool('git');
+    if ($src === null) {
+        fwrite(STDERR, "missing git; install it before packing\n");
+
+        return false;
+    }
+    $real = realpath($src);
+    if ($real === false) {
+        $real = $src;
+    }
+    ensure_dir($toolsDir);
+    ensure_dir($execDir);
+    $target = $toolsDir.'/git';
+    if (! copy($real, $target)) {
+        fwrite(STDERR, "cannot copy $real to $target\n");
+
+        return false;
+    }
+    chmod($target, 0755);
+    pack_binary_libs($real, $libDir);
+    $out = [];
+    exec(escapeshellarg($real).' --exec-path 2>/dev/null', $out, $code);
+    $exec = ($code === 0 && isset($out[0])) ? trim($out[0]) : '';
+    if ($exec !== '' && is_dir($exec)) {
+        copy_tree($exec, $execDir);
+    }
+
+    return true;
+}
+
+/**
+ * Check images do not inherit prepare's environment. The git on PATH is a
+ * wrapper so gitleaks can exec it without a pre-set GIT_EXEC_PATH.
+ */
+function install_git_wrapper(string $toolsDir, string $libDir, string $execDir): void
+{
+    $git = $toolsDir.'/git';
+    $real = $toolsDir.'/git.real';
+    if (! is_file($git) || ! is_dir($execDir)) {
+        return;
+    }
+    if (! is_file($real)) {
+        if (! rename($git, $real)) {
+            fwrite(STDERR, "cannot rename git to git.real\n");
+            exit(1);
+        }
+    }
+    $script = "#!/bin/sh\nexport GIT_EXEC_PATH=".escapeshellarg($execDir)."\n";
+    if (is_dir($libDir)) {
+        $script .= 'export LD_LIBRARY_PATH='.escapeshellarg($libDir).':${LD_LIBRARY_PATH:-}'."\n";
+    }
+    $script .= 'exec '.escapeshellarg($real).' "$@"'."\n";
+    file_put_contents($git, $script);
+    chmod($git, 0755);
 }
 
 function cmd_unpack(): void
@@ -392,6 +466,13 @@ function cmd_unpack(): void
         if (is_dir($stage.'/php-lib')) {
             ensure_dir($libDir);
             copy_tree($stage.'/php-lib', $libDir);
+        }
+        $gitCore = '/usr/local/libexec/git-core';
+        if (is_dir($stage.'/git-core') && glob($stage.'/git-core/*')) {
+            ensure_dir($gitCore);
+            copy_tree($stage.'/git-core', $gitCore);
+            install_git_wrapper($tools, $libDir, $gitCore);
+            export_env('GIT_EXEC_PATH', $gitCore);
         }
     });
     $path = $tools.':'.(getenv('PATH') ?: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin');
