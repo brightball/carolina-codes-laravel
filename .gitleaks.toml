@@ -1,0 +1,11 @@
+title = "carolina-codes-laravel"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Third-party trees only. Do not allowlist real secrets."
+paths = [
+  '''(^|/)vendor/''',
+  '''(^|/)node_modules/''',
+]

@@ -2,6 +2,7 @@
 
 namespace App\Providers;
 
+use Illuminate\Foundation\Console\ServeCommand;
 use Illuminate\Support\ServiceProvider;
 
 class AppServiceProvider extends ServiceProvider
@@ -19,8 +20,8 @@ class AppServiceProvider extends ServiceProvider
      */
     public function boot(): void
     {
-        \Illuminate\Foundation\Console\ServeCommand::$passthroughVariables = array_merge(
-            \Illuminate\Foundation\Console\ServeCommand::$passthroughVariables,
+        ServeCommand::$passthroughVariables = array_merge(
+            ServeCommand::$passthroughVariables,
             [
                 'DATABASE_URL',
                 'CAROLINA_URL',

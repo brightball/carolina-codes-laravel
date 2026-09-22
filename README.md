@@ -18,3 +18,25 @@ php artisan carolina:serve --host=[::] --port=4022
 ```bash
 php artisan test --filter=PolyglotApiTest
 ```
+
+## Quality gates
+
+Five checks run locally as distinct pre-commit hooks. On Gitea Actions a first-stage `prepare` job clones `GITHUB_SHA`, installs PHP extensions, Composer, `vendor/`, and gitleaks once, and publishes that tree as an artifact. The five check jobs restore that environment and each run only their command (`.gitea/workflows/precommit.yml`):
+
+| Check | Command |
+| --- | --- |
+| Application tests | `php artisan test` |
+| SAST (Psalm taint) | `vendor/bin/psalm --taint-analysis --no-cache --memory-limit=1G` |
+| Dependency advisories | `composer audit --locked` |
+| Secret detection | `gitleaks detect --source .` |
+| Code style | `vendor/bin/pint --test` |
+
+Install hooks (needs [pre-commit](https://pre-commit.com) on PATH):
+
+```bash
+composer install
+mise install
+pre-commit install
+```
+
+Without the Python runner, `git config core.hooksPath .githooks` runs the same five commands. Emergency skip: `SKIP=tests,sast,audit,gitleaks,pint git commit`. `gitleaks` comes from `mise.toml` (`mise install`) or any PATH install of gitleaks 8.30.1.

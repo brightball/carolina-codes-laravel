@@ -1,0 +1,36 @@
+# Local pre-commit hooks. Emergency escape: SKIP=tests,sast,audit,gitleaks,pint git commit
+# Install once: pre-commit install
+# (or: git config core.hooksPath .githooks)
+repos:
+  - repo: local
+    hooks:
+      - id: tests
+        name: application tests
+        language: system
+        entry: php artisan test
+        pass_filenames: false
+        always_run: true
+      - id: sast
+        name: psalm taint analysis
+        language: system
+        entry: vendor/bin/psalm --taint-analysis --no-cache --memory-limit=1G
+        pass_filenames: false
+        always_run: true
+      - id: audit
+        name: composer audit
+        language: system
+        entry: composer audit --locked
+        pass_filenames: false
+        always_run: true
+      - id: gitleaks
+        name: gitleaks
+        language: system
+        entry: gitleaks detect --source .
+        pass_filenames: false
+        always_run: true
+      - id: pint
+        name: laravel pint
+        language: system
+        entry: vendor/bin/pint --test
+        pass_filenames: false
+        always_run: true

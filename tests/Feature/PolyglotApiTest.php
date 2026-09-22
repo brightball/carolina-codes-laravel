@@ -3,7 +3,10 @@
 namespace Tests\Feature;
 
 use App\Catalog;
+use Illuminate\Foundation\Console\ServeCommand;
 use Illuminate\Support\Facades\DB;
+use PDO;
+use ReflectionProperty;
 use Tests\TestCase;
 use Throwable;
 
@@ -12,8 +15,7 @@ class PolyglotApiTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
-        Catalog::resetCounts();
-        Catalog::$queryFn = null;
+        Catalog::reset();
     }
 
     public function test_is_laravel_not_raw_php_sapi(): void
@@ -56,19 +58,21 @@ class PolyglotApiTest extends TestCase
     {
         $php = PHP_BINARY;
         $artisan = base_path('artisan');
-        $proc = proc_open(
-            [$php, $artisan, 'migrate'],
-            [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
-            $pipes,
-            base_path()
-        );
-        $this->assertIsResource($proc);
-        $stderr = stream_get_contents($pipes[2]);
-        fclose($pipes[1]);
-        fclose($pipes[2]);
-        $code = proc_close($proc);
-        $this->assertSame(2, $code);
-        $this->assertStringContainsString('must not alter the shared Postgres catalog', $stderr);
+        foreach (['migrate', 'migrate:fresh', 'db:wipe'] as $command) {
+            $proc = proc_open(
+                [$php, $artisan, $command],
+                [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+                $pipes,
+                base_path()
+            );
+            $this->assertIsResource($proc);
+            $stderr = stream_get_contents($pipes[2]);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            $code = proc_close($proc);
+            $this->assertSame(2, $code, $command);
+            $this->assertStringContainsString('must not alter the shared Postgres catalog', (string) $stderr, $command);
+        }
     }
 
     public function test_health_without_sql_or_postgres(): void
@@ -90,8 +94,10 @@ class PolyglotApiTest extends TestCase
         $response->assertOk();
         $body = $response->json();
         $this->assertSame('PHP', $body['language']);
+        $this->assertSame(PHP_VERSION, $body['language_version']);
         $this->assertSame('Laravel', $body['framework']);
         $this->assertSame(0, Catalog::$sqlCount);
+        $this->assertSame(0, Catalog::$connectCount);
     }
 
     public function test_unknown_speaker_slug_404(): void
@@ -137,13 +143,371 @@ class PolyglotApiTest extends TestCase
         $this->assertSame(':memory:', config('database.connections.sqlite.database'));
     }
 
+    public function test_collection_routes_return_data_arrays(): void
+    {
+        $this->installRouteFixture();
+        foreach (['/v1/years', '/v1/speakers', '/v1/sponsors'] as $path) {
+            $response = $this->getJson($path);
+            $response->assertOk();
+            $this->assertIsArray($response->json('data'), $path);
+        }
+    }
+
+    public function test_speaker_routes_return_data_or_not_found(): void
+    {
+        $this->installRouteFixture();
+
+        $hit = $this->getJson('/v1/speakers/diana-pham');
+        $hit->assertOk();
+        $this->assertSame('diana-pham', $hit->json('data.slug'));
+        $this->assertIsArray($hit->json('data.talks'));
+
+        $miss = $this->getJson('/v1/speakers/no-such-slug');
+        $miss->assertStatus(404);
+        $miss->assertExactJson(['error' => 'not_found']);
+
+        $yearHit = $this->getJson('/v1/speakers/2026/diana-pham');
+        $yearHit->assertOk();
+        $this->assertSame('diana-pham', $yearHit->json('data.slug'));
+        $this->assertIsArray($yearHit->json('data.languages'));
+        $this->assertIsArray($yearHit->json('data.topics'));
+        $this->assertNotEmpty($yearHit->json('data.languages'));
+        $this->assertNotEmpty($yearHit->json('data.topics'));
+
+        $yearMiss = $this->getJson('/v1/speakers/1999/diana-pham');
+        $yearMiss->assertStatus(404);
+        $yearMiss->assertExactJson(['error' => 'not_found']);
+
+        $unknownYear = $this->getJson('/v1/speakers/2026/no-such-slug');
+        $unknownYear->assertStatus(404);
+        $unknownYear->assertExactJson(['error' => 'not_found']);
+    }
+
+    public function test_sponsor_routes_return_data_or_not_found(): void
+    {
+        $this->installRouteFixture();
+
+        $hit = $this->getJson('/v1/sponsors/flywheel');
+        $hit->assertOk();
+        $this->assertSame('flywheel', $hit->json('data.slug'));
+
+        $miss = $this->getJson('/v1/sponsors/no-such-slug');
+        $miss->assertStatus(404);
+        $miss->assertExactJson(['error' => 'not_found']);
+
+        $yearList = $this->getJson('/v1/sponsors?year=2026');
+        $yearList->assertOk();
+        $this->assertIsArray($yearList->json('data'));
+        $this->assertNotEmpty($yearList->json('data'));
+        $this->assertArrayHasKey('tier', $yearList->json('data.0'));
+        $this->assertNotSame('', $yearList->json('data.0.tier'));
+
+        $yearHit = $this->getJson('/v1/sponsors/2026/flywheel');
+        $yearHit->assertOk();
+        $this->assertSame('flywheel', $yearHit->json('data.slug'));
+        $this->assertArrayHasKey('tier', $yearHit->json('data'));
+
+        $yearMiss = $this->getJson('/v1/sponsors/1999/flywheel');
+        $yearMiss->assertStatus(404);
+        $yearMiss->assertExactJson(['error' => 'not_found']);
+
+        $unknown = $this->getJson('/v1/sponsors/2026/no-such-slug');
+        $unknown->assertStatus(404);
+        $unknown->assertExactJson(['error' => 'not_found']);
+    }
+
+    public function test_year_scoped_speaker_queries_do_not_grow_with_row_count(): void
+    {
+        $counts = [];
+        foreach ([1, 40] as $rows) {
+            Catalog::reset();
+            Catalog::$queryFn = function (string $sql, array $args) use ($rows): array {
+                unset($args);
+                if (str_contains($sql, 'FROM v1_speakers')) {
+                    $out = [];
+                    for ($i = 0; $i < $rows; $i++) {
+                        $out[] = [
+                            'slug' => 'speaker-'.$i,
+                            'first_name' => 'A',
+                            'last_name' => 'B'.$i,
+                            'name' => 'A B'.$i,
+                        ];
+                    }
+
+                    return $out;
+                }
+                if (str_contains($sql, 'FROM v1_talks WHERE year = ?')) {
+                    $out = [];
+                    for ($i = 0; $i < $rows; $i++) {
+                        $out[] = [
+                            'slug' => 'talk-'.$i,
+                            'title' => 'Talk',
+                            'speaker_slug' => 'speaker-'.$i,
+                            'year' => 2026,
+                            'languages' => '{php}',
+                            'topics' => '{api}',
+                        ];
+                    }
+
+                    return $out;
+                }
+                if (str_contains($sql, 'speaker_slug IN')) {
+                    $out = [];
+                    for ($i = 0; $i < $rows; $i++) {
+                        $out[] = ['speaker_slug' => 'speaker-'.$i, 'year' => 2026];
+                    }
+
+                    return $out;
+                }
+
+                return [];
+            };
+            Catalog::resetCounts();
+            $response = $this->getJson('/v1/speakers?year=2026');
+            $response->assertOk();
+            $data = $response->json('data');
+            $this->assertIsArray($data);
+            $this->assertCount($rows, $data);
+            $this->assertIsArray($data[0]['languages']);
+            $this->assertIsArray($data[0]['topics']);
+            $counts[$rows] = Catalog::$sqlCount;
+        }
+
+        $this->assertSame($counts[1], $counts[40]);
+        $this->assertGreaterThan(0, $counts[1]);
+        $this->assertLessThan(40, $counts[40]);
+    }
+
+    public function test_catalog_reuses_one_pdo_across_queries(): void
+    {
+        Catalog::reset();
+        try {
+            $first = Catalog::pdo();
+            $second = Catalog::pdo();
+            $this->assertSame($first, $second);
+            $this->assertSame(1, Catalog::$connectCount);
+            $third = Catalog::query('SELECT 1 AS ok');
+            $this->assertNotEmpty($third);
+            $this->assertSame(1, Catalog::$connectCount);
+
+            return;
+        } catch (Throwable) {
+            // Catalog postgres is down. The cache branch is still the shipped pdo() path.
+        }
+
+        $sqlite = new PDO('sqlite::memory:');
+        $sqlite->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $sqlite->exec('CREATE TABLE v1_years (year INTEGER, slug TEXT, name TEXT, status TEXT)');
+        $sqlite->exec("INSERT INTO v1_years (year, slug, name, status) VALUES (2026, '2026', 'Year', 'announced')");
+        $prop = new ReflectionProperty(Catalog::class, 'pdo');
+        $prop->setValue(null, $sqlite);
+        Catalog::resetCounts();
+        Catalog::$queryFn = null;
+        $this->assertSame($sqlite, Catalog::pdo());
+        $rows = Catalog::query('SELECT year, slug, name, status FROM v1_years');
+        $this->assertSame(2026, (int) $rows[0]['year']);
+        $this->assertSame(0, Catalog::$connectCount);
+        $this->assertSame(1, Catalog::$sqlCount);
+    }
+
+    public function test_serve_passthrough_includes_catalog_env(): void
+    {
+        foreach (['DATABASE_URL', 'CAROLINA_URL', 'POLYGLOT_REGISTER_TOKEN', 'PUBLIC_BASE_URL', 'PORT', 'PHPRC'] as $key) {
+            $this->assertContains($key, ServeCommand::$passthroughVariables);
+        }
+    }
+
+    public function test_fly_suspends_idle_machines_with_memory_above_256mb(): void
+    {
+        $fly = (string) file_get_contents(base_path('fly.toml'));
+        $this->assertStringContainsString('min_machines_running = 0', $fly);
+        $this->assertStringContainsString('auto_start_machines = true', $fly);
+        $this->assertStringContainsString('auto_stop_machines = "suspend"', $fly);
+        $this->assertStringNotContainsString('auto_stop_machines = "stop"', $fly);
+        $this->assertStringNotContainsString('auto_stop_machines = "off"', $fly);
+        $this->assertStringContainsString('path = "/health"', $fly);
+        $this->assertMatchesRegularExpression('/memory\s*=\s*"(\d+)mb"/', $fly);
+        preg_match('/memory\s*=\s*"(\d+)mb"/', $fly, $match);
+        $this->assertGreaterThan(256, (int) $match[1]);
+    }
+
+    public function test_image_enables_cli_opcache_without_baking_runtime_env(): void
+    {
+        $docker = (string) file_get_contents(base_path('Dockerfile'));
+        $this->assertStringContainsString('carolina:serve', $docker);
+        $this->assertStringContainsString('--no-dev', $docker);
+        $this->assertStringContainsString('--optimize-autoloader', $docker);
+        $this->assertStringContainsString('--classmap-authoritative', $docker);
+        $this->assertStringContainsString('opcache.enable=1', $docker);
+        $this->assertStringContainsString('opcache.enable_cli=1', $docker);
+        $this->assertStringNotContainsString('config:cache', $docker);
+        $this->assertStringNotContainsString('migrate', $docker);
+        $copy = strpos($docker, 'COPY . .');
+        $dump = strpos($docker, 'dump-autoload');
+        $this->assertNotFalse($copy);
+        $this->assertNotFalse($dump);
+        $this->assertGreaterThan($copy, $dump);
+        $this->assertFileDoesNotExist(base_path('bootstrap/cache/config.php'));
+        $ignore = (string) file_get_contents(base_path('.dockerignore'));
+        $this->assertStringContainsString('bootstrap/cache/*.php', $ignore);
+        foreach (['DATABASE_URL', 'APP_KEY', 'CAROLINA_URL', 'POLYGLOT_REGISTER_TOKEN', 'PUBLIC_BASE_URL'] as $name) {
+            $this->assertDoesNotMatchRegularExpression('/^ENV\s+'.preg_quote($name, '/').'=/m', $docker);
+        }
+    }
+
+    private function installRouteFixture(): void
+    {
+        Catalog::reset();
+        Catalog::$queryFn = function (string $sql, array $args): array {
+            return $this->fixtureRows($sql, $args);
+        };
+    }
+
+    /**
+     * @param  list<mixed>  $args
+     * @return list<array<string, mixed>>
+     */
+    private function fixtureRows(string $sql, array $args): array
+    {
+        if (str_contains($sql, 'FROM v1_years')) {
+            return [['year' => 2026, 'slug' => '2026', 'name' => '2026', 'status' => 'announced']];
+        }
+        if (str_contains($sql, 'FROM v1_year_sponsors WHERE year = ? AND slug = ?')) {
+            $year = (int) ($args[0] ?? 0);
+            $slug = (string) ($args[1] ?? '');
+            if ($year === 2026 && $slug === 'flywheel') {
+                return [[
+                    'slug' => 'flywheel',
+                    'name' => 'Flywheel',
+                    'tier' => 'platinum',
+                    'year' => 2026,
+                    'website' => 'https://flywheel.example',
+                ]];
+            }
+
+            return [];
+        }
+        if (str_contains($sql, 'FROM v1_year_sponsors')) {
+            if ((int) ($args[0] ?? 0) !== 2026) {
+                return [];
+            }
+
+            return [[
+                'slug' => 'flywheel',
+                'name' => 'Flywheel',
+                'tier' => 'platinum',
+                'year' => 2026,
+            ]];
+        }
+        if (str_contains($sql, 'FROM v1_sponsorships')) {
+            $slug = (string) ($args[0] ?? '');
+            if ($slug !== 'flywheel') {
+                return [];
+            }
+            if (str_contains($sql, 'DISTINCT year')) {
+                return [['year' => 2026]];
+            }
+
+            return [['sponsor_slug' => 'flywheel', 'year' => 2026, 'tier' => 'platinum']];
+        }
+        if (str_contains($sql, 'FROM v1_sponsors WHERE slug = ?')) {
+            if ((string) ($args[0] ?? '') !== 'flywheel') {
+                return [];
+            }
+
+            return [[
+                'slug' => 'flywheel',
+                'name' => 'Flywheel',
+                'website' => 'https://flywheel.example',
+            ]];
+        }
+        if (str_contains($sql, 'FROM v1_sponsors')) {
+            return [[
+                'slug' => 'flywheel',
+                'name' => 'Flywheel',
+                'website' => 'https://flywheel.example',
+            ]];
+        }
+        if (str_contains($sql, 'FROM v1_speakers WHERE slug = ?')) {
+            if ((string) ($args[0] ?? '') !== 'diana-pham') {
+                return [];
+            }
+
+            return [[
+                'slug' => 'diana-pham',
+                'first_name' => 'Diana',
+                'last_name' => 'Pham',
+                'name' => 'Diana Pham',
+            ]];
+        }
+        if (str_contains($sql, 'FROM v1_speakers')) {
+            return [[
+                'slug' => 'diana-pham',
+                'first_name' => 'Diana',
+                'last_name' => 'Pham',
+                'name' => 'Diana Pham',
+            ]];
+        }
+        if (str_contains($sql, 'SELECT DISTINCT speaker_slug, year FROM v1_talks')) {
+            return [['speaker_slug' => 'diana-pham', 'year' => 2026]];
+        }
+        if (str_contains($sql, 'SELECT DISTINCT year FROM v1_talks')) {
+            if ((string) ($args[0] ?? '') !== 'diana-pham') {
+                return [];
+            }
+
+            return [['year' => 2026]];
+        }
+        if (str_contains($sql, 'FROM v1_talks WHERE speaker_slug = ? AND year = ?')) {
+            if ((string) ($args[0] ?? '') === 'diana-pham' && (int) ($args[1] ?? 0) === 2026) {
+                return [$this->talkRow()];
+            }
+
+            return [];
+        }
+        if (str_contains($sql, 'FROM v1_talks WHERE speaker_slug = ?')) {
+            if ((string) ($args[0] ?? '') !== 'diana-pham') {
+                return [];
+            }
+
+            return [$this->talkRow()];
+        }
+        if (str_contains($sql, 'FROM v1_talks WHERE year = ?')) {
+            if ((int) ($args[0] ?? 0) !== 2026) {
+                return [];
+            }
+
+            return [$this->talkRow()];
+        }
+
+        return [];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function talkRow(): array
+    {
+        return [
+            'slug' => 'talk',
+            'title' => 'Talk',
+            'description' => 'A talk',
+            'format' => 'talk',
+            'youtube_id' => '',
+            'year' => 2026,
+            'speaker_slug' => 'diana-pham',
+            'languages' => '{php}',
+            'topics' => '{development}',
+        ];
+    }
+
     private function ensureCatalog(): void
     {
         if (Catalog::$queryFn !== null) {
             return;
         }
         try {
-            Catalog::query('SELECT 1 AS ok');
+            Catalog::query('SELECT 1 AS ok FROM v1_speakers LIMIT 1');
         } catch (Throwable $e) {
             fwrite(STDERR, "postgres unavailable, using query hook: {$e->getMessage()}\n");
             Catalog::$queryFn = function (string $sql, array $args): array {

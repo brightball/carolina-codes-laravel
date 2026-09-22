@@ -39,19 +39,31 @@ class Catalog
 
     public const TALK_COLS = 'slug, title, description, format, youtube_id, year, speaker_slug, languages, topics';
 
+    public const REGISTER_TIMEOUT_SECONDS = 5;
+
     public static int $sqlCount = 0;
 
     public static int $connectCount = 0;
 
-    /** @var null|callable(string, array): array */
+    /** @var null|callable(string, array<int, mixed>): list<array<string, mixed>> */
     public static $queryFn = null;
 
     private static ?PDO $pdo = null;
+
+    private static bool $registrationStarted = false;
 
     public static function resetCounts(): void
     {
         self::$sqlCount = 0;
         self::$connectCount = 0;
+    }
+
+    public static function reset(): void
+    {
+        self::resetCounts();
+        self::$queryFn = null;
+        self::$pdo = null;
+        self::$registrationStarted = false;
     }
 
     public static function identity(): array
@@ -274,7 +286,8 @@ class Catalog
     }
 
     /**
-     * One-shot register. Does not open PDO.
+     * One-shot register. Does not open PDO. A missing URL or token is a no-op.
+     * A failed POST is logged and swallowed so the caller can keep serving.
      */
     public static function registerWithElixir(): void
     {
@@ -283,21 +296,33 @@ class Catalog
         if ($url === '' || $token === '') {
             return;
         }
+        if (self::$registrationStarted) {
+            return;
+        }
+        self::$registrationStarted = true;
+
         $port = getenv('PORT') ?: '4022';
         $base = getenv('PUBLIC_BASE_URL') ?: "http://127.0.0.1:{$port}";
         $body = json_encode(self::identity() + ['base_url' => $base]);
+        $timeout = self::REGISTER_TIMEOUT_SECONDS;
+        $previousTimeout = ini_get('default_socket_timeout');
+        ini_set('default_socket_timeout', (string) $timeout);
         $ctx = stream_context_create([
             'http' => [
                 'method' => 'POST',
                 'header' => "Authorization: Bearer {$token}\r\nContent-Type: application/json\r\n",
-                'content' => $body,
-                'timeout' => 5,
+                'content' => $body === false ? '{}' : $body,
+                'timeout' => $timeout,
                 'ignore_errors' => true,
             ],
         ]);
-        $resp = @file_get_contents(rtrim($url, '/').'/internal/api-endpoints/register', false, $ctx);
+        $endpoint = rtrim($url, '/').'/internal/api-endpoints/register';
+        $resp = @file_get_contents($endpoint, false, $ctx);
+        if (is_string($previousTimeout)) {
+            ini_set('default_socket_timeout', $previousTimeout);
+        }
         $code = 0;
-        if (isset($http_response_header[0]) && preg_match('/\s(\d{3})\s/', $http_response_header[0], $m)) {
+        if (isset($http_response_header[0]) && is_string($http_response_header[0]) && preg_match('/\s(\d{3})\s/', $http_response_header[0], $m)) {
             $code = (int) $m[1];
         }
         fwrite(STDERR, $resp !== false ? "registered with elixir: {$code}\n" : "register: failed\n");
