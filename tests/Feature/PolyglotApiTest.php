@@ -355,6 +355,115 @@ class PolyglotApiTest extends TestCase
         }
     }
 
+    public function test_committed_docs_state_the_polyglot_contract(): void
+    {
+        $agents = $this->committed('AGENTS.md');
+        $claude = $this->committed('CLAUDE.md');
+        $memory = $this->committed('MEMORY.md');
+        $decisions = $this->committed('DECISIONS.md');
+        $readme = $this->committed('README.md');
+        $docker = $this->committed('Dockerfile');
+        $composerRaw = $this->committed('composer.json');
+
+        foreach (['boost:install', 'composer require laravel/boost', 'Postgres 16', 'Postgres 18'] as $forbidden) {
+            $this->assertStringNotContainsString($forbidden, $agents, $forbidden);
+            $this->assertStringNotContainsString($forbidden, $claude, $forbidden);
+        }
+
+        foreach ([
+            'ordinary JSON',
+            'application/vnd.api+json',
+            'v1_*',
+            'Ash',
+            'base catalog tables',
+            '`GET /health`',
+            '`GET /`',
+            '/v1/years',
+            '/v1/speakers',
+            '/v1/sponsors',
+            '?year=',
+            '/{year}/{slug}',
+            'CAROLINA_URL',
+            'no heartbeat',
+            'Registration is not on the health path',
+            'database-free',
+            'php artisan carolina:serve',
+            'PDO',
+            ':memory:',
+            'migrate',
+            'wipe',
+            '4022',
+            'MEMORY.md',
+            'DECISIONS.md',
+            'durable decision',
+            'raw PHP',
+            'SAPI',
+            'log and keep serving',
+        ] as $phrase) {
+            $this->assertStringContainsString($phrase, $agents, $phrase);
+        }
+
+        $this->assertStringContainsString('AGENTS.md', $claude);
+        $this->assertStringContainsString('MEMORY.md', $claude);
+        $this->assertStringContainsString('DECISIONS.md', $claude);
+        $this->assertStringContainsString('Do not install Laravel Boost', $claude);
+        $this->assertStringContainsString('DECISIONS.md', $memory);
+        $this->assertFileExists(base_path('MEMORY.md'));
+        $this->assertFileExists(base_path('DECISIONS.md'));
+
+        foreach ([
+            'PDO',
+            'Eloquent',
+            ':memory:',
+            'migrate',
+            'db:wipe',
+            'register',
+            'health',
+            'heartbeat',
+            'Psalm',
+            'Pint',
+            'gitleaks',
+            'composer audit',
+            '4022',
+            'Laravel',
+            'SAPI',
+            'Pail',
+            'Pao',
+        ] as $phrase) {
+            $this->assertStringContainsString($phrase, $decisions, $phrase);
+        }
+
+        $decoded = json_decode($composerRaw, true);
+        $this->assertIsArray($decoded);
+        $require = $decoded['require'] ?? null;
+        $this->assertIsArray($require);
+        $constraint = $require['laravel/framework'] ?? null;
+        $this->assertIsString($constraint);
+        $this->assertSame(1, preg_match('/(\d+)/', $constraint, $major));
+        $majorVersion = $major[1] ?? null;
+        $this->assertIsString($majorVersion);
+        $this->assertStringContainsString('Laravel '.$majorVersion, $readme);
+
+        $this->assertSame(1, preg_match('/^FROM\s+(\S+)/m', $docker, $from));
+        $image = $from[1] ?? null;
+        $this->assertIsString($image);
+        $this->assertStringContainsString($image, $readme);
+
+        foreach (['Psalm', 'Pint', 'Pail', 'Pao', 'gitleaks', 'taint', 'agent-oriented'] as $package) {
+            $this->assertStringContainsString($package, $readme, $package);
+        }
+    }
+
+    private function committed(string $path): string
+    {
+        $contents = file_get_contents(base_path($path));
+        if (! is_string($contents)) {
+            $this->fail($path.' is not readable');
+        }
+
+        return $contents;
+    }
+
     private function installRouteFixture(): void
     {
         Catalog::reset();

@@ -15,6 +15,10 @@ php artisan carolina:serve --host=[::] --port=4022
 
 `GET /` reports `language: "PHP"` and `framework: "Laravel"`. `GET /health` returns `{"status":"ok"}` without touching Postgres.
 
+Shipped PHP is the `Dockerfile` image `php:8.5-cli`. The framework is Laravel 13 (`laravel/framework` `^13`). `composer.json` also allows PHP `^8.3`; the image is the version this API ships.
+
+Notable packages: Psalm (taint SAST), Pint, Pail, Pao (agent-oriented test output), and gitleaks.
+
 ```bash
 php artisan test --filter=PolyglotApiTest
 ```
